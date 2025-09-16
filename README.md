@@ -30,3 +30,6 @@ pip install -r requirements.txt
 python bot.py
 
 ⚙️ Token is stored in .env
+
+🏷️ Tags
+python · aiogram · telegram-bot · schedule · education · university · inline-keyboard · asyncio · dotenv · json
