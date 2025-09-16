@@ -1,5 +1,11 @@
 Telegram Schedule Bot
 
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![aiogram](https://img.shields.io/badge/aiogram-2.x-6aa84f)
+![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26a5e4)
+![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)
+![Status](https://img.shields.io/badge/Status-Active-brightgreen)
+
 📅 Бот для університетського розкладу (практичний / лекційний тиждень).  
 🔔 Є також розклад дзвінків.
 
