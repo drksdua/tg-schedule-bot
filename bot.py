@@ -1,242 +1,208 @@
-import os, json
+# bot.py
+import json
+import os
+from pathlib import Path
+from typing import Dict, List, Any
+from contextlib import suppress
+
 from aiogram import Bot, Dispatcher, types, executor
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.utils.exceptions import MessageNotModified
 from dotenv import load_dotenv
 
-# ========= базові =========
+# ------- ENV -------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("У .env нема BOT_TOKEN")
+    raise RuntimeError("BOT_TOKEN не знайдено у .env")
 
-DEFAULT_GROUP = "CS-101"   # команда /group є, але не світимо її у текстах
-
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+bot = Bot(BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# ========= дані =========
-with open("schedule.json", "r", encoding="utf-8") as f:
-    DATA = json.load(f)
-SCHED = DATA["groups"]
-
-# Вибір тижня та останній обраний день на чат
-WEEK_KIND = {}   # {chat_id: "lecture" | "practical"}
-LAST_DAY  = {}   # {chat_id: 1..7}
-
-DAY_NAMES = {
-    1: "Понеділок", 2: "Вівторок", 3: "Середа",
-    4: "Четвер", 5: "П’ятниця", 6: "Субота", 7: "Неділя"
+# ------- Константи -------
+DATA_DIR = Path("data")
+FILES = {
+    "practical": DATA_DIR / "practical.json",
+    "lecture": DATA_DIR / "lecture.json",
 }
+DAYS = ["Понеділок", "Вівторок", "Середа", "Четвер", "Пʼятниця"]
 
-# --- розклад дзвінків (1 курс магістратури) ---
-BELLS_M1 = [
-    ("1️⃣ пара", "09:00–10:20"),
-    ("2️⃣ пара", "10:30–11:50"),
-    ("3️⃣ пара", "12:20–13:40"),
-    ("4️⃣ пара", "13:50–15:10"),
-    ("5️⃣ пара", "15:20–16:40"),
-    ("6️⃣ пара", "16:50–18:10"),
-]
+# Кеш розкладів
+SCHEDULES: Dict[str, Any] = {}
 
-def bells_text(bells):
-    parts = ["🔔 <b>Розклад дзвінків</b> <i>(магістратура — 1 курс)</i>", ""]
-    for i, (name, time) in enumerate(bells, 1):
-        parts.append(f"{name}: ⏰ <b>{time}</b>")
-        if i != len(bells):
-            parts.append("· · ·")
-    return "\n".join(parts)
+# ------- Утиліти -------
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-# ===== helpers (гарне форматування) =====
-def lessons_for(group: str, day: int, kind: str):
-    return SCHED.get(group, {}).get(kind, {}).get(str(day), [])
+def load_schedules() -> None:
+    """Читає обидва файли розкладу в кеш."""
+    global SCHEDULES
+    loaded = {}
+    for key, path in FILES.items():
+        try:
+            loaded[key] = load_json(path)
+        except Exception as e:
+            loaded[key] = {"_message": f"Помилка читання {path.name}: {e}"}
+    SCHEDULES = loaded
 
-def header(day_title: str, kind: str) -> str:
-    nice = "Лекційний" if kind == "lecture" else "Практичний"
-    return f"🗓️ <b>{day_title}</b>\n🏷️ <i>{nice} тиждень</i>"
+def get_day_pairs(week_key: str, day_name: str) -> List[Dict[str, Any]]:
+    data = SCHEDULES.get(week_key, {})
+    if "_message" in data:
+        return []
+    return data.get(day_name, [])
 
-def format_summary(lessons, day_title: str, kind: str) -> str:
-    head = header(day_title, kind)
-    if not lessons:
-        return f"{head}\n\nПар немає 🎉"
-    lines = [head, ""]
-    for l in lessons:
-        lines.append(f"⏰ <b>{l['start']}-{l['end']}</b> — 📘 {l['title']}")
+def format_pairs_short(pairs: List[Dict[str, Any]]) -> str:
+    if not pairs:
+        return "❌ Пар немає."
+    lines = []
+    for p in pairs:
+        pair_no = p.get("pair")
+        subj = p.get("subject", "—")
+        lines.append(f"• <b>{pair_no} пара</b>: {subj}")
     return "\n".join(lines)
 
-def format_details(lessons, day_title: str, kind: str) -> str:
-    head = header(day_title, kind)
-    if not lessons:
-        return f"{head}\n\nПар немає 🎉"
-    parts = [head, ""]
-    for idx, l in enumerate(lessons, start=1):
-        teacher = l.get("teacher", "—")
-        room = l.get("room", "—")
-        parts += [
-            f"📚 <b>Пара {idx}</b>",
-            f"   ⏰ <b>{l['start']}-{l['end']}</b>",
-            f"   📘 <b>{l['title']}</b>",
-            f"   👤 <i>{teacher}</i>",
-            f"   🏫 {room}",
-        ]
-        if idx != len(lessons):
-            parts.append("—" * 20)
-    return "\n".join(parts)
-
-def lecture_placeholder_text() -> str:
-    return ("😅 <b>Упс…</b>\n"
-            "Розкладу <b>лекційного</b> тижня поки немає — очікуйте оновлення 🙏")
-
-# ========= клавіатури =========
-def kb_start():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("▶️ Почати", callback_data="begin"))
-    return kb
-
-def kb_main_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📚 Лекційний", callback_data="set_kind:lecture"),
-        types.InlineKeyboardButton("🧪 Практичний", callback_data="set_kind:practical"),
-    )
-    kb.add(types.InlineKeyboardButton("🔔 Розклад дзвінків", callback_data="bells_m1"))
-    return kb
-
-def kb_days():
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    day_emoji = {1:"🌤️", 2:"🌤️", 3:"🌤️", 4:"🌤️", 5:"🎉"}
-    buttons = [types.InlineKeyboardButton(f"{day_emoji.get(i,'')} {DAY_NAMES[i]}", callback_data=f"day:{i}") for i in range(1, 6)]
-    kb.add(*buttons)
-    kb.add(types.InlineKeyboardButton("🏠 У головне меню", callback_data="to_menu"))
-    return kb
-
-def kb_day_summary():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("⬅️ Назад до днів", callback_data="back_days"),
-        types.InlineKeyboardButton("ℹ️ Детальніше", callback_data="details"),
-    )
-    return kb
-
-def kb_day_details():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("⬅️ Назад до днів", callback_data="back_days"))
-    return kb
-
-def kb_lecture_placeholder():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🧪 Перейти до практичного", callback_data="set_kind:practical"),
-        types.InlineKeyboardButton("🏠 У меню", callback_data="to_menu")
-    )
-    return kb
-
-# ========= хендлери =========
-@dp.message_handler(commands=["start"])
-async def start_cmd(m: types.Message):
-    await m.answer("Привіт! 👋 Натисни, щоб почати:", reply_markup=kb_start())
-
-@dp.message_handler(commands=["help"])
-async def help_cmd(m: types.Message):
-    await m.answer("Натисни «Почати», обери тип тижня і день.", reply_markup=kb_start())
-
-@dp.message_handler(commands=["group"])
-async def cmd_group(m: types.Message):
-    global DEFAULT_GROUP
-    parts = m.text.split(maxsplit=1)
-    if len(parts) != 2:
-        await m.answer("Приклад: <code>/group CS-101</code>")
-        return
-    new_group = parts[1].strip()
-    if new_group in SCHED:
-        DEFAULT_GROUP = new_group
-        await m.answer(f"Групу змінено на <b>{DEFAULT_GROUP}</b>.", reply_markup=kb_main_menu())
-    else:
-        await m.answer("Такої групи нема. Доступні: " + ", ".join(SCHED.keys()))
-
-# --- навігація
-@dp.callback_query_handler(lambda c: c.data == "begin")
-async def begin(c: types.CallbackQuery):
-    await c.message.edit_text("Оберіть тип тижня:", reply_markup=kb_main_menu())
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "to_menu")
-async def to_menu(c: types.CallbackQuery):
-    await c.message.edit_text("Оберіть тип тижня:", reply_markup=kb_main_menu())
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "bells_m1")
-async def show_bells(c: types.CallbackQuery):
-    await c.message.edit_text(
-        bells_text(BELLS_M1),
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("⬅️ Назад у меню", callback_data="to_menu")
+def format_pairs_detailed(pairs: List[Dict[str, Any]]) -> str:
+    if not pairs:
+        return "❌ Пар немає."
+    lines = []
+    for p in pairs:
+        pair_no = p.get("pair")
+        subj = p.get("subject", "—")
+        teacher = p.get("teacher", "—")
+        room = p.get("room", "—")
+        lines.append(
+            f"📚 <b>{pair_no} пара</b>\n"
+            f"   • Предмет: <b>{subj}</b>\n"
+            f"   • Викладач: {teacher}\n"
+            f"   • Аудиторія: {room}"
         )
+    return "\n\n".join(lines)
+
+def bells_text() -> str:
+    # Магістри 1 курс (права колонка твого фото)
+    return (
+        "⏰ <b>Розклад дзвінків (магістри 1 курс)</b>\n\n"
+        "1️⃣ 09:00–10:20\n"
+        "— перерва 10 хв —\n"
+        "2️⃣ 10:30–11:50\n"
+        "— перерва 30 хв —\n"
+        "3️⃣ 12:20–13:40\n"
+        "— перерва 10 хв —\n"
+        "4️⃣ 13:50–15:10\n"
+        "— перерва 10 хв —\n"
+        "5️⃣ 15:20–16:40\n"
+        "— перерва 10 хв —\n"
+        "6️⃣ 16:50–18:10"
     )
-    await c.answer("Дзвінки відкрито")
 
-@dp.callback_query_handler(lambda c: c.data.startswith("set_kind:"))
-async def set_kind(c: types.CallbackQuery):
-    kind = c.data.split(":")[1]  # lecture | practical
-    WEEK_KIND[c.message.chat.id] = kind
+# Безпечне редагування (глушить MessageNotModified)
+async def safe_edit(message: types.Message, text: str, **kwargs):
+    with suppress(MessageNotModified):
+        return await message.edit_text(text, **kwargs)
 
-    if kind == "lecture":
-        # КОСТИЛЬ: показати плейсхолдер замість переходу до вибору дня
-        await c.message.edit_text(lecture_placeholder_text(), reply_markup=kb_lecture_placeholder())
-        await c.answer("Розклад лекційного тижня ще не додано")
-        return
+# ------- Клавіатури -------
+def kb_main() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("📘 Лекційний тиждень", callback_data="week:lecture"),
+        InlineKeyboardButton("🛠️ Практичний тиждень", callback_data="week:practical"),
+    )
+    kb.add(InlineKeyboardButton("⏰ Розклад дзвінків", callback_data="bells"))
+    return kb
 
-    # practical — як завжди
-    await c.message.edit_text("Обрано: <b>Практичний</b> тиждень.\nОберіть день:", reply_markup=kb_days())
-    await c.answer()
+def kb_home_only() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
+    return kb
 
-@dp.callback_query_handler(lambda c: c.data == "back_days")
-async def back_days(c: types.CallbackQuery):
-    await c.message.edit_text("Оберіть день (Пн–Пт):", reply_markup=kb_days())
-    await c.answer()
+def kb_days(week_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton(d, callback_data=f"day:{week_key}:{d}") for d in DAYS]
+    kb.add(*buttons)
+    kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
+    return kb
+
+def kb_day_actions(week_key: str, day_name: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("ℹ️ Детальніше", callback_data=f"detail:{week_key}:{day_name}"))
+    kb.add(
+        InlineKeyboardButton("⬅️ Назад до днів", callback_data=f"back_days:{week_key}"),
+        InlineKeyboardButton("🏠 Меню", callback_data="home"),
+    )
+    return kb
+
+# ------- Команди -------
+@dp.message_handler(commands=["start"])
+async def start(m: types.Message):
+    await m.answer("Привіт! 👋 Обери режим:", reply_markup=kb_main())
+
+@dp.message_handler(commands=["bells"])
+async def cmd_bells(m: types.Message):
+    await m.answer(bells_text(), reply_markup=kb_home_only(), disable_web_page_preview=True)
+
+@dp.message_handler(commands=["reload"])
+async def cmd_reload(m: types.Message):
+    load_schedules()
+    await m.answer("🔄 Розклади перезавантажено з файлів.")
+
+# ------- Callback-и -------
+@dp.callback_query_handler(lambda c: c.data == "home")
+async def cb_home(c: CallbackQuery):
+    await safe_edit(c.message, "Головне меню:", reply_markup=kb_main())
+    await c.answer("Вже тут ✅")
+
+@dp.callback_query_handler(lambda c: c.data == "bells")
+async def cb_bells(c: CallbackQuery):
+    await safe_edit(c.message, bells_text(), reply_markup=kb_home_only(), disable_web_page_preview=True)
+    await c.answer("Розклад дзвінків відкритий 🔔")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("week:"))
+async def cb_week(c: CallbackQuery):
+    _, week_key = c.data.split(":", 1)
+    data = SCHEDULES.get(week_key, {})
+    if "_message" in data:
+        await safe_edit(
+            c.message,
+            f"ℹ️ {data['_message']}",
+            reply_markup=kb_home_only()
+        )
+        await c.answer("Наразі лекційний розклад відсутній ℹ️")
+    else:
+        title = "🛠️ Практичний тиждень" if week_key == "practical" else "📘 Лекційний тиждень"
+        await safe_edit(c.message, f"{title}\n\nОберіть день:", reply_markup=kb_days(week_key))
+        await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("back_days:"))
+async def cb_back_days(c: CallbackQuery):
+    _, week_key = c.data.split(":", 1)
+    title = "🛠️ Практичний тиждень" if week_key == "practical" else "📘 Лекційний тиждень"
+    await safe_edit(c.message, f"{title}\n\nОберіть день:", reply_markup=kb_days(week_key))
+    await c.answer("Повернув до списку днів ↩️")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("day:"))
-async def day_pick(c: types.CallbackQuery):
-    day = int(c.data.split(":")[1])
-    LAST_DAY[c.message.chat.id] = day
-    kind = WEEK_KIND.get(c.message.chat.id)
-
-    # Якщо чомусь обраний lecture — дублюємо плейсхолдер
-    if kind == "lecture":
-        await c.message.edit_text(lecture_placeholder_text(), reply_markup=kb_lecture_placeholder())
-        await c.answer()
-        return
-
-    if not kind:
-        await c.message.edit_text("Спершу оберіть тип тижня:", reply_markup=kb_main_menu())
-        await c.answer()
-        return
-
-    lessons = lessons_for(DEFAULT_GROUP, day, kind)
-    text = format_summary(lessons, f"{DAY_NAMES[day]}", kind)
-    await c.message.edit_text(text, reply_markup=kb_day_summary())
+async def cb_day(c: CallbackQuery):
+    _, week_key, day_name = c.data.split(":", 2)
+    pairs = get_day_pairs(week_key, day_name)
+    text = f"📅 <b>{day_name}</b>\n\n{format_pairs_short(pairs)}"
+    await safe_edit(c.message, text, reply_markup=kb_day_actions(week_key, day_name))
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "details")
-async def show_details(c: types.CallbackQuery):
-    kind = WEEK_KIND.get(c.message.chat.id)
-    day  = LAST_DAY.get(c.message.chat.id)
+@dp.callback_query_handler(lambda c: c.data.startswith("detail:"))
+async def cb_detail(c: CallbackQuery):
+    _, week_key, day_name = c.data.split(":", 2)
+    pairs = get_day_pairs(week_key, day_name)
+    text = f"📅 <b>{day_name}</b>\n\n{format_pairs_detailed(pairs)}"
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("⬅️ Назад до днів", callback_data=f"back_days:{week_key}"),
+        InlineKeyboardButton("🏠 Меню", callback_data="home"),
+    )
+    await safe_edit(c.message, text, reply_markup=kb)
+    await c.answer()
 
-    # на всяк випадок — якщо lecture
-    if kind == "lecture":
-        await c.message.edit_text(lecture_placeholder_text(), reply_markup=kb_lecture_placeholder())
-        await c.answer()
-        return
-
-    if not kind or not day:
-        await c.message.edit_text("Спершу оберіть тип тижня та день:", reply_markup=kb_main_menu())
-        await c.answer()
-        return
-
-    lessons = lessons_for(DEFAULT_GROUP, day, kind)
-    text = format_details(lessons, f"{DAY_NAMES[day]}", kind)
-    await c.message.edit_text(text, reply_markup=kb_day_details())
-    await c.answer("Показую деталі")
-
-# ========= запуск =========
+# ------- Старт -------
 if __name__ == "__main__":
+    load_schedules()
     print("Starting bot…")
     executor.start_polling(dp, skip_updates=True)
