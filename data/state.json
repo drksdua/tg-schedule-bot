@@ -2,7 +2,7 @@
   "chat_id": 1375176244,
   "week": "practical",
   "notify": true,
-  "auto_rotate": false,
+  "auto_rotate": true,
   "notify_hour_before": false,
   "notify_5min_before": false
 }
