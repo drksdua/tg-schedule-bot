@@ -1,5 +1,8 @@
 {
-  "chat_id": 654953078,
+  "chat_id": 1375176244,
   "week": "practical",
-  "notify": false
+  "notify": true,
+  "auto_rotate": false,
+  "notify_hour_before": false,
+  "notify_5min_before": false
 }

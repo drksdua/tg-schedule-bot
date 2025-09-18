@@ -1,491 +1,572 @@
 # bot.py
-import json
-import os
+import os, json, asyncio, re
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any
-from contextlib import suppress
-from datetime import datetime, time, timedelta
+from typing import Dict, Any, List, Optional, Tuple
 
-import pytz
-from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.utils.exceptions import MessageNotModified
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputFile
+from aiogram.utils import executor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
+import pytz
 
-# ------- ENV -------
+# ── ENV ──────────────────────────────────────────────────────────────────────
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TZ_NAME = os.getenv("TZ", "Europe/Kyiv")
+TZ = pytz.timezone(TZ_NAME)
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не знайдено у .env")
+    raise RuntimeError("BOT_TOKEN is not set")
 
-bot = Bot(BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
-
-# ------- Константи -------
-DATA_DIR = Path("data")
-FILES = {
-    "practical": DATA_DIR / "practical.json",
-    "lecture": DATA_DIR / "lecture.json",
-}
-STATE_FILE = DATA_DIR / "state.json"   # {"chat_id": int, "week": "practical"|"lecture", "notify": true}
-DAYS = ["Понеділок", "Вівторок", "Середа", "Четвер", "Пʼятниця"]
-DAY_TO_CRON = {
-    "Понеділок": "mon",
-    "Вівторок": "tue",
-    "Середа": "wed",
-    "Четвер": "thu",
-    "Пʼятниця": "fri",
-}
-TZ = pytz.timezone("Europe/Kyiv")
-
-# Старт пар (магістри 1 курс)
-BELL_START: Dict[int, time] = {
-    1: time(9, 0),
-    2: time(10, 30),
-    3: time(12, 20),
-    4: time(13, 50),
-    5: time(15, 20),
-    6: time(16, 50),
-}
-
-# Кеш розкладів
-SCHEDULES: Dict[str, Any] = {}
-
-# APScheduler
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# ------- Утиліти збереження стану -------
+# ── PATHS ───────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+PRACTICAL_FILE = DATA_DIR / "practical.json"
+LECTURE_FILE   = DATA_DIR / "lecture.json"
+BELLS_FILE     = DATA_DIR / "bells.json"
+STATE_FILE     = DATA_DIR / "state.json"
+
+# ── CACHE ───────────────────────────────────────────────────────────────────
+CACHE: Dict[str, Any] = {
+    "practical": {},
+    "lecture": {},
+    "bells": {},
+    "state": {}
+}
+UPLOAD_WAIT: Dict[int, str] = {}  # очікування файлу від адміна: {user_id: "practical"|...}
+
+# ── STATE ───────────────────────────────────────────────────────────────────
+def default_state() -> Dict[str, Any]:
+    # за замовчуванням: практичний, автозміна щопонеділка, нагадування вимкнені
+    return {
+        "chat_id": None,
+        "week": "practical",
+        "auto_rotate": True,
+        "notify_hour_before": False,
+        "notify_5min_before": False,
+    }
+
 def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data.setdefault("auto_rotate", True)
+            data.setdefault("notify_hour_before", False)
+            data.setdefault("notify_5min_before", False)
+            return data
         except Exception:
             pass
-    return {"chat_id": None, "week": "practical", "notify": False}
+    return default_state()
 
 def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    CACHE["state"] = state
 
-# ------- Утиліти розкладу -------
-def load_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
+def toggle_week_value(week_key: str) -> str:
+    return "practical" if week_key == "lecture" else "lecture"
+
+def week_label(week_key: str) -> str:
+    return "Лекційний" if week_key == "lecture" else "Практичний"
+
+# ── DATA ────────────────────────────────────────────────────────────────────
+def load_json_file(p: Path) -> Any:
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
         return json.load(f)
 
-def load_schedules() -> None:
-    """Читає обидва файли розкладу в кеш."""
-    global SCHEDULES
-    loaded = {}
-    for key, path in FILES.items():
-        try:
-            loaded[key] = load_json(path)
-        except Exception as e:
-            loaded[key] = {"_message": f"Помилка читання {path.name}: {e}"}
-    SCHEDULES = loaded
+def reload_cache() -> None:
+    CACHE["practical"] = load_json_file(PRACTICAL_FILE)
+    CACHE["lecture"]   = load_json_file(LECTURE_FILE)
+    CACHE["bells"]     = load_json_file(BELLS_FILE)
+    CACHE["state"]     = load_state()
 
-def get_day_pairs(week_key: str, day_name: str) -> List[Dict[str, Any]]:
-    data = SCHEDULES.get(week_key, {})
-    if "_message" in data:
-        return []
-    return data.get(day_name, [])
+# ── HELPERS ─────────────────────────────────────────────────────────────────
+PAIR_EMOJI = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣"}
+UA_DAYS = ["Понеділок","Вівторок","Середа","Четвер","Пʼятниця","Субота","Неділя"]
 
-def format_pairs_short(pairs: List[Dict[str, Any]]) -> str:
+def today_day_name(tz: pytz.timezone) -> str:
+    now = datetime.now(tz)
+    idx = (now.weekday() + 0) % 7  # 0=Mon
+    return UA_DAYS[idx]
+
+def parse_bell_start(bell_val: str) -> Tuple[int,int]:
+    # "09:00-10:20" -> (9,0)
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*\d{1,2}:\d{2}\s*$", bell_val)
+    if not m:
+        raise ValueError(f"Bad bell time: {bell_val}")
+    return int(m.group(1)), int(m.group(2))
+
+def _bell_range(pair_num: int) -> Optional[str]:
+    bells = CACHE.get("bells") or {}
+    return bells.get(str(pair_num))
+
+def format_day(week_key: str, day_name: str, detailed: bool) -> str:
+    """Додає години з дзвінків у детальному режимі."""
+    data = CACHE[week_key] or {}
+    pairs: List[Dict[str, Any]] = data.get(day_name, [])
+    head = f"📆 <b>{day_name}</b> • {week_label(week_key)} тиждень"
     if not pairs:
-        return "❌ Пар немає."
-    lines = []
-    for p in pairs:
-        pair_no = p.get("pair")
-        subj = p.get("subject", "—")
-        lines.append(f"• <b>{pair_no} пара</b>: {subj}")
+        return f"{head}\n— пар немає 🙂"
+    lines = [head]
+    for it in sorted(pairs, key=lambda x: int(x.get("pair", 0))):
+        p = int(it.get("pair", 0))
+        subj = it.get("subject", "")
+        room = it.get("room", "")
+        if detailed:
+            teacher = it.get("teacher", "")
+            hours = _bell_range(p)
+            time_str = f"\n🕒 {hours}" if hours else ""
+            lines.append(
+                f"{PAIR_EMOJI.get(p, str(p))} <b>{subj}</b>{time_str}\n"
+                f"🏫 {room}{('  •  👤 '+teacher) if teacher else ''}"
+            )
+        else:
+            tail = f" — {room}" if room else ""
+            lines.append(f"{PAIR_EMOJI.get(p, str(p))} {subj}{tail}")
     return "\n".join(lines)
 
-def format_pairs_detailed(pairs: List[Dict[str, Any]]) -> str:
-    if not pairs:
-        return "❌ Пар немає."
-    lines = []
-    for p in pairs:
-        pair_no = p.get("pair")
-        subj = p.get("subject", "—")
-        teacher = p.get("teacher", "—")
-        room = p.get("room", "—")
-        lines.append(
-            f"📚 <b>{pair_no} пара</b>\n"
-            f"   • Предмет: <b>{subj}</b>\n"
-            f"   • Викладач: {teacher}\n"
-            f"   • Аудиторія: {room}"
-        )
-    return "\n\n".join(lines)
+def format_bells() -> str:
+    bells = CACHE["bells"] or {}
+    if not bells:
+        return "🔔 Розклад дзвінків наразі порожній."
+    lines = ["🔔 <b>Розклад дзвінків</b> (Магістр 1)"]
+    for k in sorted(bells.keys(), key=lambda x: int(x)):
+        lines.append(f"{PAIR_EMOJI.get(int(k), k)} {bells[k]}")
+    lines.append("\n⬅️ Повернутися: натисніть «Назад» нижче.")
+    return "\n".join(lines)
 
-def bells_text() -> str:
-    return (
-        "⏰ <b>Розклад дзвінків (магістри 1 курс)</b>\n\n"
-        "1️⃣ 09:00–10:20\n"
-        "— перерва 10 хв —\n"
-        "2️⃣ 10:30–11:50\n"
-        "— перерва 30 хв —\n"
-        "3️⃣ 12:20–13:40\n"
-        "— перерва 10 хв —\n"
-        "4️⃣ 13:50–15:10\n"
-        "— перерва 10 хв —\n"
-        "5️⃣ 15:20–16:40\n"
-        "— перерва 10 хв —\n"
-        "6️⃣ 16:50–18:10"
-    )
-
-def today_day_name(dt: datetime) -> str:
-    # 0=Mon..6=Sun
-    idx = dt.weekday()
-    return DAYS[idx] if idx < 5 else "Вихідний"
-
-def safe_get_first_pair(pairs: List[Dict[str, Any]]) -> Dict[str, Any] | None:
-    if not pairs:
-        return None
-    return sorted(pairs, key=lambda x: x.get("pair", 99))[0]
-
-# Безпечне редагування (глушить MessageNotModified)
-async def safe_edit(message: types.Message, text: str, **kwargs):
-    with suppress(MessageNotModified):
-        return await message.edit_text(text, **kwargs)
-
-# ------- Клавіатури -------
+# ── KEYBOARDS ───────────────────────────────────────────────────────────────
 def kb_main() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("📘 Лекційний тиждень", callback_data="week:lecture"),
-        InlineKeyboardButton("🛠️ Практичний тиждень", callback_data="week:practical"),
-    )
-    kb.add(InlineKeyboardButton("⏰ Розклад дзвінків", callback_data="bells"))
-    kb.add(InlineKeyboardButton("🔔 Нагадування", callback_data="notify:menu"))
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📚 Розклад пар", callback_data="sched:open"))
+    kb.add(InlineKeyboardButton("🔔 Розклад дзвінків", callback_data="bells:open"))
+    kb.add(InlineKeyboardButton("⚙️ Налаштування", callback_data="settings:open"))
     return kb
 
-def kb_home_only() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
+def kb_sched_weeks() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🧪 Практичний", callback_data="sched:week:practical"),
+        InlineKeyboardButton("📖 Лекційний",  callback_data="sched:week:lecture"),
+    )
     kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
     return kb
 
-def kb_days(week_key: str) -> InlineKeyboardMarkup:
+def kb_sched_days(week_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=3)
-    buttons = [InlineKeyboardButton(d, callback_data=f"day:{week_key}:{d}") for d in DAYS]
-    kb.add(*buttons)
-    kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
-    return kb
-
-def kb_day_actions(week_key: str, day_name: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("ℹ️ Детальніше", callback_data=f"detail:{week_key}:{day_name}"))
+    kb.row(
+        InlineKeyboardButton("Пн", callback_data=f"sched:day:{week_key}:Понеділок"),
+        InlineKeyboardButton("Вт", callback_data=f"sched:day:{week_key}:Вівторок"),
+        InlineKeyboardButton("Ср", callback_data=f"sched:day:{week_key}:Середа"),
+    )
+    kb.row(
+        InlineKeyboardButton("Чт", callback_data=f"sched:day:{week_key}:Четвер"),
+        InlineKeyboardButton("Пт", callback_data=f"sched:day:{week_key}:Пʼятниця"),
+    )
     kb.add(
-        InlineKeyboardButton("⬅️ Назад до днів", callback_data=f"back_days:{week_key}"),
-        InlineKeyboardButton("🏠 Меню", callback_data="home"),
+        InlineKeyboardButton("⬅️ Назад до тижнів", callback_data="sched:open"),
+        InlineKeyboardButton("🏠 В головне меню", callback_data="home"),
     )
     return kb
 
-def kb_week_select(prefix: str = "setweek") -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("📘 Лекційний", callback_data=f"{prefix}:lecture"),
-        InlineKeyboardButton("🛠️ Практичний", callback_data=f"{prefix}:practical"),
-    )
-    kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
-    return kb
-
-def kb_notify_menu(state: Dict[str, Any]) -> InlineKeyboardMarkup:
-    enabled = state.get("notify", False)
-    kb = InlineKeyboardMarkup()
-    if enabled:
-        kb.add(InlineKeyboardButton("🔕 Вимкнути нагадування", callback_data="notify:off"))
+def kb_day_view(week_key: str, day_name: str, detailed: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    if detailed:
+        kb.add(InlineKeyboardButton("🔙 Коротко", callback_data=f"sched:view:{week_key}:{day_name}:short"))
     else:
-        kb.add(InlineKeyboardButton("🔔 Увімкнути нагадування", callback_data="notify:on"))
-    kb.add(InlineKeyboardButton("🗓 Обрати тиждень", callback_data="setweek:menu"))
-    kb.add(InlineKeyboardButton("🏠 В головне меню", callback_data="home"))
+        kb.add(InlineKeyboardButton("🔎 Детально", callback_data=f"sched:view:{week_key}:{day_name}:detail"))
+    kb.add(
+        InlineKeyboardButton("⬅️ Назад до днів", callback_data=f"sched:week:{week_key}"),
+        InlineKeyboardButton("🏠 В головне меню", callback_data="home"),
+    )
     return kb
 
-# ------- Планування (APScheduler) -------
-def remove_jobs_for_chat(chat_id: int):
-    for job in scheduler.get_jobs():
-        if job.id.startswith(f"{chat_id}:"):
+def kb_bells_back() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home"))
+    return kb
+
+def kb_settings(state: Dict[str, Any]) -> InlineKeyboardMarkup:
+    """Тільки нагадування — без авто-ротації для користувачів."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(
+            f"{'✅' if state.get('notify_hour_before') else '❌'} ⏰ За 1 год до першої",
+            callback_data="settings:toggle:hour"),
+        InlineKeyboardButton(
+            f"{'✅' if state.get('notify_5min_before') else '❌'} ⌛ За 5 хв до кожної",
+            callback_data="settings:toggle:5min"),
+    )
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home"))
+    return kb
+
+# ── SAFE EDIT ───────────────────────────────────────────────────────────────
+async def safe_edit(message: types.Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            return
+        await message.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
+
+# ── NOTIFICATIONS SCHEDULING ────────────────────────────────────────────────
+def _notif_job_id_prefix(chat_id: int) -> str:
+    return f"{chat_id}:notif:"
+
+def _clear_notif_jobs(chat_id: int):
+    pref = _notif_job_id_prefix(chat_id)
+    for job in list(scheduler.get_jobs()):
+        if job.id.startswith(pref):
             scheduler.remove_job(job.id)
 
-def schedule_static_jobs_for_chat(chat_id: int):
-    """
-    Ставимо:
-      - щоденно (пн-пт) тригери на 5 хв до кожної пари (1..6)
-      - щоденно (пн-пт) тригер за 1 год до ПЕРШОЇ пари
-      - щонеділі 18:00 — запитати тиждень
-    Логіка “яка пара є сьогодні” визначається під час виконання — за актуальним state.week.
-    """
-    # 5 хв до кожної пари (пн-пт)
-    for day_name, cron_day in DAY_TO_CRON.items():
-        for pair_no, t in BELL_START.items():
-            h, m = t.hour, t.minute
-            # 5 хв до початку
-            send_m = (datetime(2000,1,1,h,m) - timedelta(minutes=5)).minute
-            send_h = (datetime(2000,1,1,h,m) - timedelta(minutes=5)).hour
-            job_id = f"{chat_id}:warn5m:{cron_day}:{pair_no}"
-            scheduler.add_job(
-                notify_5min_before_pair,
-                trigger="cron",
-                id=job_id,
-                day_of_week=cron_day,
-                hour=send_h,
-                minute=send_m,
-                args=[chat_id, pair_no],
-                replace_existing=True,
-                misfire_grace_time=60,
-            )
-        # 1 година до першої пари — поставимо на фіксований час 08:00 (бо перша пара 09:00)
-        job_id = f"{chat_id}:warn1h:{cron_day}"
-        scheduler.add_job(
-            notify_1h_before_first_pair,
-            trigger="cron",
-            id=job_id,
-            day_of_week=cron_day,
-            hour=8,
-            minute=0,
-            args=[chat_id],
-            replace_existing=True,
-            misfire_grace_time=300,
-        )
+def _first_pair_today(week_key: str, day_name: str) -> Optional[int]:
+    items = (CACHE.get(week_key) or {}).get(day_name, [])
+    if not items:
+        return None
+    return min(int(x.get("pair", 99)) for x in items)
 
-    # Неділя 18:00 — запитати тиждень
+def _pairs_today(week_key: str, day_name: str) -> List[int]:
+    items = (CACHE.get(week_key) or {}).get(day_name, [])
+    return sorted(int(x.get("pair")) for x in items if "pair" in x)
+
+def _pair_text(week_key: str, day_name: str, pair_num: int) -> str:
+    items = (CACHE.get(week_key) or {}).get(day_name, [])
+    for it in items:
+        if int(it.get("pair", -1)) == int(pair_num):
+            subj = it.get("subject","")
+            room = it.get("room","")
+            teacher = it.get("teacher","")
+            hours = _bell_range(pair_num)
+            time_line = f"\n🕒 {hours}" if hours else ""
+            return f"{PAIR_EMOJI.get(pair_num,str(pair_num))} <b>{subj}</b>{time_line}\n🏫 {room}{'  •  👤 '+teacher if teacher else ''}"
+    return f"Пара №{pair_num}"
+
+async def _send_hour_before(chat_id: int, week_key: str, day_name: str, pair_num: int):
+    txt = f"⏰ <b>За 1 годину</b> почнеться перша пара сьогодні:\n{_pair_text(week_key, day_name, pair_num)}"
+    await bot.send_message(chat_id, txt)
+
+async def _send_5min_before(chat_id: int, week_key: str, day_name: str, pair_num: int):
+    txt = f"⌛ <b>Через 5 хв</b> стартує:\n{_pair_text(week_key, day_name, pair_num)}"
+    await bot.send_message(chat_id, txt)
+
+def schedule_today_notifications(chat_id: int):
+    """Планує нагадування на поточний день згідно state/bells/schedule."""
+    state = load_state()
+    week_key = state.get("week", "practical")
+    dh = today_day_name(TZ)
+    bells = CACHE.get("bells") or {}
+
+    _clear_notif_jobs(chat_id)
+
+    first_pair = _first_pair_today(week_key, dh)
+    if first_pair is None:
+        return
+
+    # 1) За годину до першої
+    if state.get("notify_hour_before"):
+        start_str = bells.get(str(first_pair))
+        if start_str:
+            h, m = parse_bell_start(start_str)
+            dt = TZ.localize(datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)) - timedelta(hours=1)
+            if dt > datetime.now(TZ):
+                scheduler.add_job(
+                    _send_hour_before, "date",
+                    id=f"{_notif_job_id_prefix(chat_id)}hour",
+                    run_date=dt, args=[chat_id, week_key, dh, first_pair],
+                    misfire_grace_time=300, replace_existing=True
+                )
+
+    # 2) За 5 хв до кожної
+    if state.get("notify_5min_before"):
+        for p in _pairs_today(week_key, dh):
+            start_str = bells.get(str(p))
+            if not start_str:
+                continue
+            h, m = parse_bell_start(start_str)
+            dt = TZ.localize(datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)) - timedelta(minutes=5)
+            if dt > datetime.now(TZ):
+                scheduler.add_job(
+                    _send_5min_before, "date",
+                    id=f"{_notif_job_id_prefix(chat_id)}p{p}",
+                    run_date=dt, args=[chat_id, week_key, dh, p],
+                    misfire_grace_time=300, replace_existing=True
+                )
+
+# ── AUTO-WEEK ROTATION ─────────────────────────────────────────────────────
+async def auto_rotate_job(chat_id: int):
+    state = load_state()
+    if state.get("chat_id") != chat_id or not state.get("auto_rotate", True):
+        return
+    state["week"] = toggle_week_value(state.get("week","practical"))
+    save_state(state)
+    reload_cache()
+    try:
+        await bot.send_message(chat_id, f"🔄 Автоматично встановлено тиждень: <b>{week_label(state['week'])}</b>")
+    except Exception:
+        pass
+    schedule_today_notifications(chat_id)
+
+def schedule_fixed_jobs(chat_id: int):
+    # авто-ротація щопонеділка 00:05
     scheduler.add_job(
-        ask_week_on_sunday,
+        auto_rotate_job,
         trigger="cron",
-        id=f"{chat_id}:askweek:sun",
-        day_of_week="sun",
-        hour=18,
-        minute=0,
+        id=f"{chat_id}:autorotate",
+        day_of_week="mon",
+        hour=0, minute=5,
+        args=[chat_id],
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    # Щодня о 00:10 — оновити нагадування на день
+    scheduler.add_job(
+        schedule_today_notifications,
+        trigger="cron",
+        id=f"{chat_id}:replan_daily",
+        hour=0, minute=10,
         args=[chat_id],
         replace_existing=True,
         misfire_grace_time=300,
     )
 
-async def notify_1h_before_first_pair(chat_id: int):
-    state = load_state()
-    if not state.get("notify") or state.get("chat_id") != chat_id:
-        return
-    # Сьогоднішній день
-    now = datetime.now(TZ)
-    day_name = today_day_name(now)
-    if day_name not in DAYS:
-        return
-    pairs = get_day_pairs(state.get("week", "practical"), day_name)
-    first_p = safe_get_first_pair(pairs)
-    if not first_p:
-        return
-    subj = first_p.get("subject", "—")
-    room = first_p.get("room", "—")
-    pair_no = first_p.get("pair")
-    txt = (
-        f"⏰ <b>Через 1 годину</b> почнеться пара {pair_no} — <b>{subj}</b>\n"
-        f"🏫 Аудиторія: {room}"
-    )
-    try:
-        await bot.send_message(chat_id, txt)
-    except Exception:
-        pass
-
-async def notify_5min_before_pair(chat_id: int, pair_no: int):
-    state = load_state()
-    if not state.get("notify") or state.get("chat_id") != chat_id:
-        return
-    now = datetime.now(TZ)
-    day_name = today_day_name(now)
-    if day_name not in DAYS:
-        return
-    pairs = get_day_pairs(state.get("week", "practical"), day_name)
-    target = [p for p in pairs if p.get("pair") == pair_no]
-    if not target:
-        return
-    p = target[0]
-    subj = p.get("subject", "—")
-    room = p.get("room", "—")
-    txt = (
-        f"⏳ <b>За 5 хв</b> почнеться пара {pair_no} — <b>{subj}</b>\n"
-        f"🏫 Аудиторія: {room}"
-    )
-    try:
-        await bot.send_message(chat_id, txt)
-    except Exception:
-        pass
-
-async def ask_week_on_sunday(chat_id: int):
-    state = load_state()
-    if state.get("chat_id") != chat_id:
-        return
-    txt = (
-        "🗓 <b>Вибір тижня на наступний цикл</b>\n"
-        "Оберіть, будь ласка, який тиждень актуальний із понеділка:"
-    )
-    try:
-        await bot.send_message(chat_id, txt, reply_markup=kb_week_select(prefix="setweek"))
-    except Exception:
-        pass
-
-def reschedule_for_chat(chat_id: int, ensure_started=True):
-    remove_jobs_for_chat(chat_id)
-    schedule_static_jobs_for_chat(chat_id)
-    if ensure_started and not scheduler.running:
-        scheduler.start()
-
-# ------- Команди -------
+# ── START / HOME ────────────────────────────────────────────────────────────
 @dp.message_handler(commands=["start"])
 async def start(m: types.Message):
-    state = load_state()
-    state["chat_id"] = m.chat.id
-    save_state(state)
-    # гарантуємо розклад задач
-    reschedule_for_chat(m.chat.id)
-    await m.answer("Привіт! 👋 Обери режим:", reply_markup=kb_main())
+    st = load_state()
+    if not st.get("chat_id"):
+        st["chat_id"] = m.chat.id
+        save_state(st)
+        reload_cache()
+        schedule_fixed_jobs(m.chat.id)
+        schedule_today_notifications(m.chat.id)
+    hello = (
+        "👋 Привіт! Я бот розкладу.\n"
+        "Оберіть дію:"
+    )
+    await m.answer(hello, reply_markup=kb_main())
 
-@dp.message_handler(commands=["bells"])
-async def cmd_bells(m: types.Message):
-    await m.answer(bells_text(), reply_markup=kb_home_only(), disable_web_page_preview=True)
-
-@dp.message_handler(commands=["reload"])
-async def cmd_reload(m: types.Message):
-    load_schedules()
-    await m.answer("🔄 Розклади перезавантажено з файлів.")
-
-@dp.message_handler(commands=["notify_on"])
-async def cmd_notify_on(m: types.Message):
-    state = load_state()
-    state["chat_id"] = m.chat.id
-    state["notify"] = True
-    save_state(state)
-    reschedule_for_chat(m.chat.id)
-    await m.answer("🔔 Нагадування увімкнено.\n"
-                   "• За 1 годину до першої пари дня\n"
-                   "• За 5 хв до кожної пари")
-
-@dp.message_handler(commands=["notify_off"])
-async def cmd_notify_off(m: types.Message):
-    state = load_state()
-    state["notify"] = False
-    save_state(state)
-    await m.answer("🔕 Нагадування вимкнено.")
-
-@dp.message_handler(commands=["setweek"])
-async def cmd_setweek(m: types.Message):
-    await m.answer("Оберіть активний тиждень:", reply_markup=kb_week_select())
-
-@dp.message_handler(commands=["weekstatus"])
-async def cmd_weekstatus(m: types.Message):
-    state = load_state()
-    cur = state.get("week", "practical")
-    flag = "увімкнені" if state.get("notify") else "вимкнені"
-    await m.answer(f"ℹ️ Активний тиждень: <b>{'Практичний' if cur=='practical' else 'Лекційний'}</b>\n"
-                   f"🔔 Нагадування: {flag}")
-
-# ------- Callback-и (навігація) -------
 @dp.callback_query_handler(lambda c: c.data == "home")
 async def cb_home(c: CallbackQuery):
-    await safe_edit(c.message, "Головне меню:", reply_markup=kb_main())
-    await c.answer("Вже тут ✅")
+    await safe_edit(c.message, "🏠 <b>Головне меню</b>:", reply_markup=kb_main())
+    await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "bells")
+# ── SCHEDULE FLOW (week -> day -> view) ─────────────────────────────────────
+@dp.callback_query_handler(lambda c: c.data == "sched:open")
+async def sched_open(c: CallbackQuery):
+    await safe_edit(c.message, "📚 <b>Розклад пар</b>\nОберіть тип тижня:", reply_markup=kb_sched_weeks())
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sched:week:"))
+async def sched_week(c: CallbackQuery):
+    _, _, week_key = c.data.split(":")
+    await safe_edit(c.message, f"📅 Оберіть день • <b>{week_label(week_key)}</b> тиждень", reply_markup=kb_sched_days(week_key))
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sched:day:"))
+async def sched_day(c: CallbackQuery):
+    _, _, week_key, day_name = c.data.split(":", 3)
+    text = format_day(week_key, day_name, detailed=False)
+    await safe_edit(c.message, text, reply_markup=kb_day_view(week_key, day_name, detailed=False))
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sched:view:"))
+async def sched_view_toggle(c: CallbackQuery):
+    _, _, week_key, day_name, mode = c.data.split(":", 4)
+    detailed = (mode == "detail")
+    text = format_day(week_key, day_name, detailed=detailed)
+    await safe_edit(c.message, text, reply_markup=kb_day_view(week_key, day_name, detailed=detailed))
+    await c.answer()
+
+# ── BELLS ───────────────────────────────────────────────────────────────────
+@dp.callback_query_handler(lambda c: c.data == "bells:open")
 async def cb_bells(c: CallbackQuery):
-    await safe_edit(c.message, bells_text(), reply_markup=kb_home_only(), disable_web_page_preview=True)
-    await c.answer("Розклад дзвінків відкритий 🔔")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("week:"))
-async def cb_week(c: CallbackQuery):
-    _, week_key = c.data.split(":", 1)
-    data = SCHEDULES.get(week_key, {})
-    if "_message" in data:
-        await safe_edit(c.message, f"ℹ️ {data['_message']}", reply_markup=kb_home_only())
-        await c.answer("Наразі лекційний розклад відсутній ℹ️")
-    else:
-        title = "🛠️ Практичний тиждень" if week_key == "practical" else "📘 Лекційний тиждень"
-        await safe_edit(c.message, f"{title}\n\nОберіть день:", reply_markup=kb_days(week_key))
-        await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("back_days:"))
-async def cb_back_days(c: CallbackQuery):
-    _, week_key = c.data.split(":", 1)
-    title = "🛠️ Практичний тиждень" if week_key == "practical" else "📘 Лекційний тиждень"
-    await safe_edit(c.message, f"{title}\n\nОберіть день:", reply_markup=kb_days(week_key))
-    await c.answer("Повернув до списку днів ↩️")
-
-@dp.callback_query_handler(lambda c: c.data.startswith("day:"))
-async def cb_day(c: CallbackQuery):
-    _, week_key, day_name = c.data.split(":", 2)
-    pairs = get_day_pairs(week_key, day_name)
-    text = f"📅 <b>{day_name}</b>\n\n{format_pairs_short(pairs)}"
-    await safe_edit(c.message, text, reply_markup=kb_day_actions(week_key, day_name))
+    txt = format_bells()
+    await safe_edit(c.message, txt, reply_markup=kb_bells_back())
     await c.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("detail:"))
-async def cb_detail(c: CallbackQuery):
-    _, week_key, day_name = c.data.split(":", 2)
-    pairs = get_day_pairs(week_key, day_name)
-    text = f"📅 <b>{day_name}</b>\n\n{format_pairs_detailed(pairs)}"
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("⬅️ Назад до днів", callback_data=f"back_days:{week_key}"),
-        InlineKeyboardButton("🏠 Меню", callback_data="home"),
+# ── SETTINGS (reminders only) ───────────────────────────────────────────────
+@dp.callback_query_handler(lambda c: c.data == "settings:open")
+async def settings_open(c: CallbackQuery):
+    st = load_state()
+    text = (
+        "⚙️ <b>Налаштування</b>\n\n"
+        f"• Поточний тиждень: <b>{week_label(st.get('week','practical'))}</b>\n"
+        "• Увімкніть потрібні нагадування:"
     )
-    await safe_edit(c.message, text, reply_markup=kb)
+    await safe_edit(c.message, text, reply_markup=kb_settings(st))
     await c.answer()
 
-# ------- Callback-и (setweek / notify) -------
-@dp.callback_query_handler(lambda c: c.data == "setweek:menu")
-async def cb_setweek_menu(c: CallbackQuery):
-    await safe_edit(c.message, "Оберіть активний тиждень:", reply_markup=kb_week_select())
-    await c.answer()
+@dp.callback_query_handler(lambda c: c.data.startswith("settings:toggle:"))
+async def settings_toggle(c: CallbackQuery):
+    st = load_state()
+    kind = c.data.split(":", 2)[2]
+    if kind == "hour":
+        st["notify_hour_before"] = not st.get("notify_hour_before", False)
+    elif kind == "5min":
+        st["notify_5min_before"] = not st.get("notify_5min_before", False)
+    save_state(st); reload_cache()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("setweek:"))
-async def cb_setweek(c: CallbackQuery):
-    _, week_key = c.data.split(":", 1)
-    if week_key not in ("lecture", "practical"):
-        await c.answer("Невідомий тип тижня", show_alert=True)
+    if st.get("chat_id"):
+        schedule_today_notifications(st["chat_id"])
+
+    text = (
+        "⚙️ <b>Налаштування</b>\n\n"
+        f"• Поточний тиждень: <b>{week_label(st.get('week','practical'))}</b>\n"
+        "• Оновлено✅. За потреби перемкніть інші опції:"
+    )
+    await safe_edit(c.message, text, reply_markup=kb_settings(st))
+    await c.answer("Збережено")
+
+# ── ADMIN ───────────────────────────────────────────────────────────────────
+@dp.message_handler(lambda m: m.text and m.text.strip().lower() in ("/admin", "//admin"))
+async def admin_entry(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        await m.reply("⛔ Ви не адміністратор цього бота.")
         return
-    state = load_state()
-    state["week"] = week_key
-    # якщо ще не записаний chat_id — запишемо
-    state["chat_id"] = state.get("chat_id") or c.message.chat.id
-    save_state(state)
-    # Перепланувати джоби (часи ті самі, логіка читає актуальний state)
-    reschedule_for_chat(state["chat_id"])
-    await safe_edit(
-        c.message,
-        f"✅ Тиждень встановлено: <b>{'Лекційний' if week_key=='lecture' else 'Практичний'}</b>",
-        reply_markup=kb_main()
+    st = load_state()
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📤 Завантажити поточні JSON", callback_data="admin:download"),
+        InlineKeyboardButton("📥 Оновити practical.json", callback_data="admin:upload:practical"),
+        InlineKeyboardButton("📥 Оновити lecture.json",   callback_data="admin:upload:lecture"),
+        InlineKeyboardButton("📥 Оновити bells.json",     callback_data="admin:upload:bells"),
     )
-    await c.answer("Збережено ✅")
+    kb.add(
+        InlineKeyboardButton(f"♻️ Перемкнути тиждень (зараз: {week_label(st.get('week','practical'))})", callback_data="admin:toggle_week"),
+        InlineKeyboardButton("🔁 Авто-ротація: " + ("УВІМК" if st.get("auto_rotate", True) else "ВИМК"),
+                             callback_data="admin:toggle_auto"),
+    )
+    kb.add(InlineKeyboardButton("❌ Закрити", callback_data="admin:close"))
+    await m.answer("🔐 Адмін-панель:", reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data == "notify:menu")
-async def cb_notify_menu(c: CallbackQuery):
-    state = load_state()
-    await safe_edit(c.message, "Налаштування нагадувань:", reply_markup=kb_notify_menu(state))
-    await c.answer()
+@dp.callback_query_handler(lambda c: c.data.startswith("admin:"))
+async def admin_actions(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer("⛔ Ви не адміністратор цього бота.", show_alert=True)
+        return
+    action = c.data.split(":",1)[1]
 
-@dp.callback_query_handler(lambda c: c.data == "notify:on")
-async def cb_notify_on(c: CallbackQuery):
-    state = load_state()
-    state["chat_id"] = c.message.chat.id
-    state["notify"] = True
-    save_state(state)
-    reschedule_for_chat(state["chat_id"])
-    await safe_edit(c.message, "🔔 Нагадування увімкнено.", reply_markup=kb_notify_menu(state))
-    await c.answer("Увімкнено 🔔")
+    if action == "download":
+        sent = False
+        for name, path in (("practical.json", PRACTICAL_FILE), ("lecture.json", LECTURE_FILE), ("bells.json", BELLS_FILE)):
+            if path.exists():
+                await bot.send_document(c.message.chat.id, InputFile(str(path), filename=name))
+                sent = True
+        if not sent:
+            await c.answer("Немає файлів", show_alert=True)
+        else:
+            await c.answer("Надіслано файли")
+        return
 
-@dp.callback_query_handler(lambda c: c.data == "notify:off")
-async def cb_notify_off(c: CallbackQuery):
-    state = load_state()
-    state["notify"] = False
-    save_state(state)
-    await safe_edit(c.message, "🔕 Нагадування вимкнено.", reply_markup=kb_notify_menu(state))
-    await c.answer("Вимкнено 🔕")
+    if action.startswith("upload:"):
+        kind = action.split(":",1)[1]  # practical|lecture|bells
+        UPLOAD_WAIT[c.from_user.id] = kind
+        await safe_edit(
+            c.message,
+            f"📥 Надішли файл <b>{kind}.json</b> у відповідь на це повідомлення.\n"
+            "Я перевірю JSON і, якщо все ок, заміню файл і перезавантажу дані.",
+            reply_markup=None
+        )
+        await c.answer("Чекаю файл")
+        return
 
-# ------- Старт -------
-if __name__ == "__main__":
-    load_schedules()
-    # Піднімаємо scheduler одразу, і якщо в state вже є chat_id+notify — розкладемо задачі
+    if action == "toggle_week":
+        st = load_state()
+        st["week"] = toggle_week_value(st.get("week", "practical"))
+        save_state(st); reload_cache()
+        await safe_edit(c.message, f"✅ Перемкнуто на: <b>{week_label(st['week'])}</b>", reply_markup=None)
+        if st.get("chat_id"):
+            schedule_today_notifications(st["chat_id"])
+        await c.answer("Готово")
+        return
+
+    if action == "toggle_auto":
+        st = load_state()
+        st["auto_rotate"] = not st.get("auto_rotate", True)
+        save_state(st); reload_cache()
+        await safe_edit(c.message, "Збережено ✅", reply_markup=None)
+        await c.answer()
+        return
+
+    if action == "close":
+        await safe_edit(c.message, "Адмін-панель закрито.", reply_markup=None)
+        await c.answer()
+        return
+
+# прийом JSON від адміна
+def validate_schedule_payload(kind: str, data: Any):
+    try:
+        if kind in ("practical","lecture"):
+            if not isinstance(data, dict): return False, "Очікується обʼєкт { 'Понеділок': [ ... ] }"
+            for day, items in data.items():
+                if not isinstance(items, list): return False, f"{day}: очікується список"
+                for it in items:
+                    if not isinstance(it, dict): return False, f"{day}: елементи мають бути обʼєктами"
+                    if "pair" not in it or "subject" not in it: return False, f"{day}: потрібні поля 'pair' і 'subject'"
+        elif kind == "bells":
+            if not isinstance(data, dict): return False, "Очікується обʼєкт { '1': '09:00-10:20', ... }"
+            for k,v in data.items():
+                int(k)
+                if not isinstance(v, str): return False, "Час має бути рядком"
+        else:
+            return False, "Невідомий тип"
+    except Exception as e:
+        return False, f"Помилка валідації: {e}"
+    return True, "OK"
+
+@dp.message_handler(content_types=types.ContentType.DOCUMENT)
+async def on_doc(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        await m.reply("⛔ Ви не адміністратор цього бота.")
+        return
+    kind = UPLOAD_WAIT.get(m.from_user.id)
+    if not kind:
+        return
+    doc = m.document
+    if not doc.file_name.lower().endswith(".json"):
+        await m.reply("⚠️ Надішли саме JSON-файл.")
+        return
+    tmp = DATA_DIR / f"__upload_{m.from_user.id}_{doc.file_name}"
+    await doc.download(destination_file=tmp)
+    try:
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        await m.reply(f"❌ Не вдалося прочитати JSON: {e}")
+        return
+    ok, msg = validate_schedule_payload(kind, data)
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        await m.reply(f"❌ Невалідний JSON: {msg}")
+        return
+    target = {"practical": PRACTICAL_FILE, "lecture": LECTURE_FILE, "bells": BELLS_FILE}[kind]
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.unlink(missing_ok=True)
+    reload_cache()
+    UPLOAD_WAIT.pop(m.from_user.id, None)
+    await m.reply(f"✅ Оновлено <b>{target.name}</b>. Дані перезавантажено.")
     st = load_state()
     if st.get("chat_id"):
-        reschedule_for_chat(st["chat_id"], ensure_started=False)
-    if not scheduler.running:
-        scheduler.start()
-    print("Starting bot…")
-    executor.start_polling(dp, skip_updates=True)
+        schedule_today_notifications(st["chat_id"])
+
+# ── STARTUP ─────────────────────────────────────────────────────────────────
+async def on_startup(dp: Dispatcher):
+    reload_cache()
+    st = CACHE["state"]
+    if st.get("chat_id"):
+        schedule_fixed_jobs(st["chat_id"])
+        schedule_today_notifications(st["chat_id"])
+    scheduler.start()
+
+if __name__ == "__main__":
+    executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
