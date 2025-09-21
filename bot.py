@@ -637,6 +637,39 @@ async def on_doc(m: types.Message):
             pass
     UPLOAD_WAIT.pop(m.from_user.id, None)
 
+# ── HANDLER: TEST ───────────────────────────────────────────────────────────
+@dp.message_handler(commands=["test"])
+async def test_now(m: types.Message):
+    """Планує два тестові нагадування: +5с і +10с і вони самі видаляться."""
+    g = load_global()
+    week_key = g.get("week", "practical")
+    day_name = today_day_name(TZ)
+    pair_num = _first_pair_today(week_key, day_name) or 1  # якщо немає пар — візьмемо №1
+
+    now = datetime.now(TZ)
+
+    # Тест 'за 5 хв' → через 5 секунд
+    scheduler.add_job(
+        _send_5min_before, "date",
+        id=f"test:{m.chat.id}:5",
+        run_date=now + timedelta(seconds=5),
+        args=[m.chat.id, week_key, day_name, pair_num],
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    # Тест 'за 1 год' → через 10 секунд
+    scheduler.add_job(
+        _send_hour_before, "date",
+        id=f"test:{m.chat.id}:60",
+        run_date=now + timedelta(seconds=10),
+        args=[m.chat.id, week_key, day_name, pair_num],
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    await m.reply("🧪 Тест заплановано на +5с та +10с.")
+
 # ── STARTUP ─────────────────────────────────────────────────────────────────
 async def on_startup(dp: Dispatcher):
     reload_cache()
