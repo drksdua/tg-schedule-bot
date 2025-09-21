@@ -3,6 +3,6 @@
   "week": "practical",
   "notify": true,
   "auto_rotate": true,
-  "notify_hour_before": false,
-  "notify_5min_before": false
+  "notify_hour_before": true,
+  "notify_5min_before": true
 }

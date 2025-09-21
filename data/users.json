@@ -1,0 +1,10 @@
+{
+  "1375176244": {
+    "notify_hour_before": true,
+    "notify_5min_before": true
+  },
+  "654953078": {
+    "notify_hour_before": true,
+    "notify_5min_before": true
+  }
+}
